@@ -28,15 +28,37 @@ services:
     image: ollama/ollama:0.40.15
     volumes: [ollama:/root/.ollama]
 
+  rerank:
+    # Cross-encoder reranker (bge-reranker-v2-m3, ~600 MB Q8 GGUF, downloaded into the volume on first start).
+    image: ghcr.io/ggml-org/llama.cpp:server-b11718
+    environment: {LLAMA_CACHE: /models}
+    command: >-
+      -hf ${RERANK_MODEL:-gpustack/bge-reranker-v2-m3-GGUF:Q8_0} --reranking
+      --host 0.0.0.0 --port 8080 -c 8192 -np 4 -b 2048 -ub 2048
+    volumes: [rerank:/models]
+    restart: unless-stopped
+
   mcp:
     <<: *app
-    # ponytail: no auth, so only bound to localhost. Put a reverse proxy with auth in front before exposing on Tailscale.
-    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      DATABASE_URL: postgresql://rfc:rfc@db/rfc
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      EMBED_MODEL: nomic-embed-text
+      RERANK_URL: ${RERANK_URL-http://rerank:8080}  # set to empty to disable
+      MCP_TOKEN: ${MCP_TOKEN:-}                     # bearer token; empty = no auth (localhost only!)
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}     # extra Host headers, e.g. rfc.example.ts.net:*
+    # Only bound to localhost unless MCP_BIND is set; set MCP_TOKEN before exposing it anywhere else.
+    ports: ["${MCP_BIND:-127.0.0.1}:8000:8000"]
     restart: unless-stopped
 
   ingest:
     <<: *app
+    environment:
+      DATABASE_URL: postgresql://rfc:rfc@db/rfc
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      EMBED_MODEL: nomic-embed-text
+      RERANK_URL: ${RERANK_URL-http://rerank:8080}  # used by tests.eval
     profiles: [tools]
     command: python -m rfc_rag.ingest
 
-volumes: {pgdata: {}, ollama: {}}
+volumes: {pgdata: {}, ollama: {}, rerank: {}}

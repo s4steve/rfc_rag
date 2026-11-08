@@ -1,5 +1,5 @@
 from rfc_rag.fetch import draft_relations, errata_section
-from rfc_rag.parse import parse_txt, parse_xml, section_text
+from rfc_rag.parse import citations, parse_txt, parse_xml, section_text
 
 # Excerpt shaped like RFC 1035: body at column 0, page break mid-paragraph, no TOC.
 RFC1035 = """\
@@ -99,6 +99,12 @@ RFC9460 = """<rfc number="9460">
   <references pn="section-15.1"><name>Normative References</name>
     <reference anchor="RFC1035"><front><title>Domain names</title></front></reference>
   </references>
+  <references pn="section-15.2"><name>Informative References</name>
+    <reference anchor="RFC1035"><front><title>Domain names</title></front></reference>
+    <reference anchor="RFC7858"><front><title>DNS over TLS</title></front></reference>
+    <reference anchor="I-D.ietf-dnsop-svcb-dane"><front><title>Using DANE with SVCB</title></front></reference>
+    <reference anchor="RFC9460"><front><title>Self</title></front></reference>
+  </references>
 </references>
 <section anchor="decoding" numbered="true" pn="section-appendix.a"><name>Decoding Text</name><t>Escapes.</t></section>
 </back>
@@ -107,7 +113,7 @@ RFC9460 = """<rfc number="9460">
 
 def test_xml_sections():
     secs = {s["id"]: s for s in parse_xml(RFC9460)}
-    assert list(secs) == ["abstract", "2", "2.2", "15", "15.1", "A"]
+    assert list(secs) == ["abstract", "2", "2.2", "15", "15.1", "15.2", "A"]
     assert secs["2.2"]["parent"] == "2"
     kinds = [b["kind"] for b in secs["2.2"]["blocks"]]
     assert kinds == ["text", "text", "figure"]
@@ -123,3 +129,12 @@ def test_errata_section_and_draft_relations():
     assert errata_section("GLOBAL") is None
     head = "DNSOP                                    A. Author\nInternet-Draft\nUpdates: 1035, 2181 (if approved)          Example\n"
     assert draft_relations(head) == {"updates": ["RFC1035", "RFC2181"], "obsoletes": []}
+
+
+def test_citations():
+    assert citations(parse_xml(RFC9460), "RFC9460") == [
+        ("RFC1035", "normative"), ("RFC7858", "informative"), ("draft-ietf-dnsop-svcb-dane", "informative")]
+    # text refs: "RFC 1035"-style mentions, kind unknown without a normative/informative title
+    secs = [{"id": "9", "title": "REFERENCES", "parent": None, "embed": False,
+             "blocks": [{"kind": "text", "text": "[RFC1035] Mockapetris, RFC 1035, 1987. draft-ietf-dnsop-foo-03.txt"}]}]
+    assert citations(secs, "RFC2181") == [("RFC1035", "unknown"), ("draft-ietf-dnsop-foo", "unknown")]

@@ -243,3 +243,25 @@ def parse_xml(data: bytes | str) -> list[dict]:
 
 def section_text(sec: dict) -> str:
     return "\n\n".join(b["text"] for b in sec["blocks"])
+
+
+CITE_RFC = re.compile(r"\bRFC\s?(\d{1,5})\b")
+CITE_DRAFT = re.compile(r"\b(?:draft-|I-D\.)([a-z0-9]+(?:-[a-z0-9]+)+)")
+
+
+def citations(sections: list[dict], self_id: str) -> list[tuple[str, str]]:
+    """(dst, kind) edges from the References sections; kind from the section (or parent) title."""
+    by_id = {s["id"]: s for s in sections}
+    out: dict[str, str] = {}
+    for s in sections:
+        if s["embed"]:
+            continue
+        titles = (s["title"] + " " + by_id.get(s["parent"], {}).get("title", "")).lower()
+        kind = "normative" if "normative" in titles else "informative" if "informative" in titles else "unknown"
+        text = section_text(s)
+        dsts = [f"RFC{int(n)}" for n in CITE_RFC.findall(text)]
+        dsts += ["draft-" + re.sub(r"-\d\d$", "", d) for d in CITE_DRAFT.findall(text)]
+        for d in dsts:
+            if d != self_id and out.get(d) != "normative":  # normative wins if cited in both lists
+                out[d] = kind
+    return sorted(out.items())

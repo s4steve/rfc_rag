@@ -1,7 +1,8 @@
+-- Idempotent: runs at DB init and again at the start of every ingest, so new columns/tables land on live DBs.
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Every RFC in the index (metadata only, for graph lookups) plus active DNS Internet-Drafts.
-CREATE TABLE documents (
+CREATE TABLE IF NOT EXISTS documents (
     doc_id       text PRIMARY KEY,            -- 'RFC1035' or 'draft-ietf-dnsop-grease'
     doc_type     text NOT NULL,               -- 'rfc' | 'draft'
     title        text NOT NULL,
@@ -22,11 +23,13 @@ CREATE TABLE documents (
     expires      text,
     url          text
 );
-CREATE INDEX ON documents USING gin (obsoletes);
-CREATE INDEX ON documents USING gin (updates);
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS also text[] NOT NULL DEFAULT '{}';  -- STD/BCP subseries, e.g. {STD13}
+CREATE INDEX IF NOT EXISTS documents_obsoletes_idx ON documents USING gin (obsoletes);
+CREATE INDEX IF NOT EXISTS documents_updates_idx ON documents USING gin (updates);
+CREATE INDEX IF NOT EXISTS documents_also_idx ON documents USING gin (also);
 
 -- Parent chunks: whole sections, returned for context expansion.
-CREATE TABLE sections (
+CREATE TABLE IF NOT EXISTS sections (
     doc_id     text NOT NULL REFERENCES documents ON DELETE CASCADE,
     section_id text NOT NULL,                 -- '4.1.1', 'A.2', 'abstract'
     parent_id  text,
@@ -38,7 +41,7 @@ CREATE TABLE sections (
 );
 
 -- Child chunks: what gets embedded and searched.
-CREATE TABLE chunks (
+CREATE TABLE IF NOT EXISTS chunks (
     chunk_id     text PRIMARY KEY,            -- 'RFC1035#4.1.1#0', 'RFC1035#errata-562'
     doc_id       text NOT NULL REFERENCES documents ON DELETE CASCADE,
     section_id   text,
@@ -51,12 +54,12 @@ CREATE TABLE chunks (
     embedding    vector(768) NOT NULL,
     tsv          tsvector GENERATED ALWAYS AS (to_tsvector('english', context || ' ' || content)) STORED
 );
-CREATE INDEX ON chunks (doc_id);
-CREATE INDEX ON chunks USING gin (tsv);
+CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks (doc_id);
+CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING gin (tsv);
 -- ponytail: no HNSW index; exact scan over ~50k rows is fast and stays correct under status filters.
 -- Add `USING hnsw (embedding vector_cosine_ops)` + hnsw.iterative_scan if the corpus grows past ~500k.
 
-CREATE TABLE errata (
+CREATE TABLE IF NOT EXISTS errata (
     errata_id  text PRIMARY KEY,
     doc_id     text NOT NULL REFERENCES documents ON DELETE CASCADE,
     section_id text,
@@ -66,14 +69,23 @@ CREATE TABLE errata (
     corrected  text,
     notes      text
 );
-CREATE INDEX ON errata (doc_id, section_id);
+CREATE INDEX IF NOT EXISTS errata_doc_id_section_id_idx ON errata (doc_id, section_id);
 
-CREATE TABLE iana (
+CREATE TABLE IF NOT EXISTS iana (
     registry    text NOT NULL,
     value       text,
     name        text,
     description text,
     refs        text[] NOT NULL DEFAULT '{}'
 );
-CREATE INDEX ON iana (lower(name));
-CREATE INDEX ON iana (value);
+CREATE INDEX IF NOT EXISTS iana_lower_idx ON iana (lower(name));
+CREATE INDEX IF NOT EXISTS iana_value_idx ON iana (value);
+
+-- Citation edges parsed from in-scope docs' References sections (dst may be any RFC or a draft name).
+CREATE TABLE IF NOT EXISTS cites (
+    src  text NOT NULL REFERENCES documents ON DELETE CASCADE,
+    dst  text NOT NULL,
+    kind text NOT NULL,                       -- 'normative' | 'informative' | 'unknown'
+    PRIMARY KEY (src, dst)
+);
+CREATE INDEX IF NOT EXISTS cites_dst_idx ON cites (dst);

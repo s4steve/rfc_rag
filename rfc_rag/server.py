@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
 
@@ -9,6 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 from rfc_rag import embed
+from rfc_rag import rerank as reranker
 from rfc_rag.chunk import label
 from rfc_rag.db import connect
 
@@ -26,11 +28,21 @@ RRF_K = 60
 
 
 def norm_id(doc: str) -> str:
-    """'1035' / 'rfc 1035' / 'RFC1035' -> 'RFC1035'; draft names pass through (minus any -NN revision)."""
-    m = re.fullmatch(r"\s*(?:rfc\s*)?(\d+)\s*", doc, re.I)
+    """'1035' / 'rfc 1035' -> 'RFC1035'; 'STD 13' / 'bcp0091' -> 'STD13' / 'BCP91';
+    draft names pass through (minus any -NN revision)."""
+    m = re.fullmatch(r"\s*(rfc|std|bcp)?\s*(\d+)\s*", doc, re.I)
     if m:
-        return f"RFC{int(m.group(1))}"
+        return f"{(m.group(1) or 'rfc').upper()}{int(m.group(2))}"
     return re.sub(r"-\d\d$", "", doc.strip().lower())
+
+
+def resolve(conn, doc: str) -> list[str]:
+    """Doc ids for a doc reference; an STD/BCP number expands to its member RFCs."""
+    d = norm_id(doc)
+    if not re.fullmatch(r"(STD|BCP)\d+", d):
+        return [d]
+    return [r["doc_id"] for r in conn.execute(
+        "SELECT doc_id FROM documents WHERE also @> ARRAY[%s] ORDER BY length(doc_id), doc_id", (d,))]
 
 
 def anchor(url: str, sid: str | None) -> str:
@@ -46,8 +58,19 @@ def search(query: str, k: int = 8, include_obsolete: bool = False, include_draft
 
     By default only current RFCs are searched: no obsoleted/Historic RFCs and no Internet-Drafts.
     statuses filters on RFC status, e.g. ["PROPOSED STANDARD", "INTERNET STANDARD", "BEST CURRENT PRACTICE"].
-    docs limits the search to specific documents, e.g. ["RFC4034", "RFC4035"].
+    docs limits the search to specific documents, e.g. ["RFC4034", "RFC4035"] (STD/BCP numbers also work).
     """
+    return _search(query, k, include_obsolete, include_drafts, statuses, docs)
+
+
+# Sections handed to the reranker. ponytail: latency is ~linear in this (~0.2 s/passage on Docker CPU, bge-v2-m3).
+POOL = int(os.environ.get("RERANK_POOL", "20"))
+
+
+def _search(query: str, k: int = 8, include_obsolete: bool = False, include_drafts: bool = False,
+            statuses: list[str] | None = None, docs: list[str] | None = None, rerank: bool = True) -> list[dict]:
+    k = min(k, 30)
+    rerank = rerank and bool(reranker.URL)
     where, params = ["true"], {}
     if not include_obsolete:
         where.append("(d.is_current OR d.doc_type = 'draft')")
@@ -58,9 +81,10 @@ def search(query: str, k: int = 8, include_obsolete: bool = False, include_draft
         params["statuses"] = [s.upper() for s in statuses]
     if docs:
         where.append("d.doc_id = ANY(%(docs)s)")
-        params["docs"] = [norm_id(d) for d in docs]
+        with connect() as conn:
+            params["docs"] = [x for d in docs for x in resolve(conn, d)]
     w = " AND ".join(where)
-    params |= {"v": embed.vec(embed.embed([query], query=True)[0]), "t": query, "k": min(k, 30) * 3}
+    params |= {"v": embed.vec(embed.embed([query], query=True)[0]), "t": query, "k": 2 * max(k, POOL) if rerank else k * 3}
     sql = f"""
     WITH vec AS (
         SELECT c.chunk_id, row_number() OVER (ORDER BY c.embedding <=> %(v)s::vector) AS r
@@ -75,8 +99,8 @@ def search(query: str, k: int = 8, include_obsolete: bool = False, include_draft
         SELECT chunk_id, sum(1.0 / ({RRF_K} + r)) AS score
         FROM (SELECT * FROM vec UNION ALL SELECT * FROM lex) u GROUP BY chunk_id
         ORDER BY score DESC LIMIT %(k)s)
-    SELECT c.doc_id, c.section_id, s.title AS section_title, c.kind, c.content, f.score,
-           d.title, d.status, d.is_current, d.obsoleted_by, d.updated_by, d.url,
+    SELECT c.doc_id, c.section_id, s.title AS section_title, c.kind, c.context, c.content, f.score,
+           d.title, d.status, d.is_current, d.obsoleted_by, d.updated_by, d.also, d.url,
            EXISTS (SELECT 1 FROM errata e WHERE e.doc_id = c.doc_id AND e.section_id = c.section_id) AS has_errata
     FROM fused f JOIN chunks c USING (chunk_id) JOIN documents d USING (doc_id)
     LEFT JOIN sections s ON s.doc_id = c.doc_id AND s.section_id = c.section_id
@@ -89,18 +113,31 @@ def search(query: str, k: int = 8, include_obsolete: bool = False, include_draft
         if key not in seen:
             seen.add(key)
             out.append(r)
-    rows = out[: min(k, 30)]
+    for r in out:
+        r["rrf"] = r["score"] = round(float(r["score"]), 4)
+    scores = reranker.rerank(query, [f"{r['context']}\n{r['content']}" for r in out[: max(k, POOL)]]) if rerank else None
+    if scores:
+        out = out[: len(scores)]
+        for r, s in zip(out, scores):
+            r["score"] = round(s, 4)
+        out.sort(key=lambda r: r["score"], reverse=True)
+    rows = out[:k]
     for r in rows:
+        del r["context"]
         r["citation"] = f"{label(r['doc_id'])} §{r['section_id']}" if r["section_id"] else label(r["doc_id"])
         r["url"] = anchor(r["url"], r["section_id"])
-        r["score"] = round(float(r["score"]), 4)
     return rows
 
 
 @mcp.tool()
 def get_document(doc: str) -> dict:
-    """Metadata, status, obsoletes/updates relations and table of contents for an RFC or draft."""
-    doc = norm_id(doc)
+    """Metadata, status, obsoletes/updates relations, STD/BCP membership, citations and table of contents
+    for an RFC or draft. An STD/BCP number (e.g. 'STD 13') returns each member RFC."""
+    with connect() as conn:
+        ids = resolve(conn, doc)
+    if ids != [norm_id(doc)]:
+        return {"alias": norm_id(doc), "documents": [get_document(i) for i in ids]}
+    doc = ids[0]
     with connect() as conn:
         d = conn.execute("SELECT * FROM documents WHERE doc_id = %s", (doc,)).fetchone()
         if not d:
@@ -108,7 +145,23 @@ def get_document(doc: str) -> dict:
         d["toc"] = [f"{'  ' * (r['depth'] - 1)}{r['section_id']} {r['title']}" for r in conn.execute(
             "SELECT section_id, title, depth FROM sections WHERE doc_id = %s ORDER BY ord", (doc,))]
         d["errata_count"] = conn.execute("SELECT count(*) AS n FROM errata WHERE doc_id = %s", (doc,)).fetchone()["n"]
+        d["cites"] = {}
+        for r in conn.execute("SELECT dst, kind FROM cites WHERE src = %s ORDER BY length(dst), dst", (doc,)):
+            d["cites"].setdefault(r["kind"], []).append(r["dst"])
+        d["cited_by_count"] = conn.execute("SELECT count(*) AS n FROM cites WHERE dst = %s", (doc,)).fetchone()["n"]
     return d
+
+
+@mcp.tool()
+def cited_by(doc: str, current_only: bool = True, limit: int = 100) -> list[dict]:
+    """Documents in the store whose References cite this RFC or draft, with their status and whether the
+    citation is normative. Only DNS documents in the store are scanned, so this is 'cited by DNS specs'."""
+    with connect() as conn:
+        return conn.execute(
+            f"""SELECT d.doc_id, d.title, d.status, d.is_current, c.kind FROM cites c JOIN documents d ON d.doc_id = c.src
+                WHERE c.dst = ANY(%s) {"AND (d.is_current OR d.doc_type = 'draft')" if current_only else ""}
+                ORDER BY d.doc_type DESC, c.kind = 'normative' DESC, length(d.doc_id) DESC, d.doc_id DESC LIMIT %s""",
+            (resolve(conn, doc), min(limit, 500))).fetchall()
 
 
 @mcp.tool()
@@ -133,8 +186,9 @@ def lineage(doc: str) -> dict:
     """Follow obsoleted-by links forward to the current spec(s), listing what updates each one,
     plus active Internet-Drafts that propose to update or obsolete them."""
     start = norm_id(doc)
-    nodes, seen, queue = [], set(), [start]
+    nodes, seen = [], set()
     with connect() as conn:
+        queue = resolve(conn, doc)
         while queue:
             cur = queue.pop(0)
             if cur in seen:
@@ -196,14 +250,36 @@ def lookup_registry(query: str, registry: str | None = None) -> list[dict]:
     return rows
 
 
+def require_bearer(app, token: str):
+    """ASGI wrapper: every HTTP request needs 'Authorization: Bearer <token>' (lifespan events pass through)."""
+    want = f"Bearer {token}".encode()
+
+    async def guarded(scope, receive, send):
+        if scope["type"] == "http" and not hmac.compare_digest(dict(scope["headers"]).get(b"authorization", b""), want):
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [(b"content-type", b"text/plain"), (b"www-authenticate", b"Bearer")]})
+            await send({"type": "http.response.body", "body": b"unauthorized"})
+            return
+        await app(scope, receive, send)
+
+    return guarded
+
+
 if __name__ == "__main__":
-    mcp.run(
-        "streamable-http",
+    import uvicorn
+
+    extra = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    app = mcp.streamable_http_app(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8000")),
         # DNS-rebinding protection stays on even though we bind 0.0.0.0 inside the container.
         transport_security=TransportSecuritySettings(
-            allowed_hosts=["localhost:*", "127.0.0.1:*"],
-            allowed_origins=["http://localhost:*", "http://127.0.0.1:*"],
+            allowed_hosts=["localhost:*", "127.0.0.1:*", *extra],
+            allowed_origins=["http://localhost:*", "http://127.0.0.1:*",
+                             *(f"{s}://{h}" for h in extra for s in ("http", "https"))],
         ),
     )
+    if token := os.environ.get("MCP_TOKEN"):
+        app = require_bearer(app, token)
+    else:
+        print("MCP_TOKEN not set: no auth. Keep the port bound to localhost.", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

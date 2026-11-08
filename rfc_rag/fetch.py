@@ -79,8 +79,20 @@ def load_index(refresh: bool = False) -> dict[str, dict]:
             "draft_state": None,
             "expires": None,
             "url": f"https://www.rfc-editor.org/rfc/rfc{num}",
+            "also": [],
         }
+    add_subseries(root, docs)
     return docs
+
+
+def add_subseries(root, docs: dict[str, dict]) -> None:
+    """STD/BCP membership from <std-entry>/<bcp-entry>: RFC1035.also = ['STD13']."""
+    for tag in ("std-entry", "bcp-entry"):
+        for e in root.findall(f"r:{tag}", NS):
+            alias = re.sub(r"^([A-Z]+)0*(\d)", r"\1\2", e.findtext("r:doc-id", namespaces=NS))
+            for rfc in _ids(e, "is-also"):
+                if rfc in docs:
+                    docs[rfc]["also"].append(alias)
 
 
 def mark_scope(docs: dict[str, dict]) -> None:

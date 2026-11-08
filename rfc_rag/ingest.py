@@ -11,10 +11,11 @@ from rfc_rag import chunk, embed, fetch, parse
 from rfc_rag.db import connect
 
 NORMALIZED = Path("data/normalized")
+SCHEMA = Path(__file__).resolve().parent.parent / "schema.sql"
 
 DOC_COLS = ["doc_id", "doc_type", "title", "status", "stream", "wg", "area", "pub_date", "abstract",
             "obsoletes", "obsoleted_by", "updates", "updated_by", "in_scope", "draft_rev", "draft_state",
-            "expires", "url"]
+            "expires", "url", "also"]
 
 
 def upsert_documents(cur, docs: list[dict]) -> None:
@@ -105,8 +106,11 @@ def main() -> None:
         except Exception as e:
             print(f"  no text for {d['doc_id']}: {e}", flush=True)
     docs |= drafts
+    for d in docs.values():
+        d.setdefault("also", [])
 
     with connect() as conn, conn.cursor() as cur:
+        cur.execute(SCHEMA.read_text())  # idempotent migrations
         upsert_documents(cur, list(docs.values()))
         cur.execute("DELETE FROM documents WHERE doc_type = 'draft' AND NOT doc_id = ANY(%s)", (list(drafts),))
         cur.execute("TRUNCATE iana")
@@ -138,6 +142,10 @@ def main() -> None:
         conn.commit()
 
         for n, (doc, secs) in enumerate(parsed.items(), 1):
+            cur.execute("DELETE FROM cites WHERE src = %s", (doc,))
+            cur.executemany("INSERT INTO cites VALUES (%s, %s, %s)",
+                            [(doc, dst, kind) for dst, kind in parse.citations(secs, doc)])
+            conn.commit()
             k = store_doc(conn, docs[doc], secs, errata.get(doc, []))
             print(f"[{n}/{len(parsed)}] {doc}: {len(secs)} sections, {k} embedded", flush=True)
 
