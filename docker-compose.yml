@@ -1,0 +1,42 @@
+x-app: &app
+  build: .
+  image: rfc-rag
+  environment:
+    DATABASE_URL: postgresql://rfc:rfc@db/rfc
+    OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+    EMBED_MODEL: nomic-embed-text
+  volumes:
+    - ./data:/app/data
+  depends_on:
+    db: {condition: service_healthy}
+    ollama: {condition: service_started}
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment: {POSTGRES_USER: rfc, POSTGRES_PASSWORD: rfc, POSTGRES_DB: rfc}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports: ["127.0.0.1:5433:5432"]
+    healthcheck:
+      test: pg_isready -U rfc
+      interval: 2s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:0.40.15
+    volumes: [ollama:/root/.ollama]
+
+  mcp:
+    <<: *app
+    # ponytail: no auth, so only bound to localhost. Put a reverse proxy with auth in front before exposing on Tailscale.
+    ports: ["127.0.0.1:8000:8000"]
+    restart: unless-stopped
+
+  ingest:
+    <<: *app
+    profiles: [tools]
+    command: python -m rfc_rag.ingest
+
+volumes: {pgdata: {}, ollama: {}}
