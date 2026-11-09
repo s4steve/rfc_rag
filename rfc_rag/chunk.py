@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import re
+
 SIZE = 1000      # chars per child chunk
 OVERLAP = 150    # only used when a single paragraph is longer than SIZE
+FIG_CAP = 1800   # figures up to this stay whole: fits the reranker's 2000 chars with the context header
+BLOB = re.compile(r"(?:^[ \t]*[A-Za-z0-9+/=]{40,}[ \t]*(?:\n|\Z)){4,}", re.M)  # armored keys, base64 bodies, hex dumps
 
 
 def label(doc_id: str) -> str:
@@ -16,7 +20,12 @@ def _rfcs(ids: list[str], cap: int = 6) -> str:
 
 
 def context(meta: dict, sec_id: str | None, sec_title: str | None) -> str:
-    status = "Internet-Draft (work in progress)" if meta["doc_type"] == "draft" else meta["status"].title()
+    if meta["doc_type"] != "draft":
+        status = meta["status"].title()
+    elif meta["stream"] == "individual":
+        status = "Individual Internet-Draft (proposal, not WG-adopted)"
+    else:
+        status = "Internet-Draft (work in progress)"
     parts = [label(meta["doc_id"]), status]
     if meta["obsoleted_by"]:
         parts.append(f"OBSOLETED by {_rfcs(meta['obsoleted_by'])}")
@@ -51,10 +60,12 @@ def split_to_size(text: str, size: int = SIZE, overlap: int = OVERLAP) -> list[s
 
 
 def pack(blocks: list[dict], size: int = SIZE) -> list[str]:
-    """Greedy-pack paragraph blocks into chunks. Figures and tables are never split."""
+    """Greedy-pack paragraph blocks into chunks. Figures and tables stay whole up to FIG_CAP.
+    Encoded data is left out of the index; get_section still returns it."""
     pieces = []
     for b in blocks:
-        pieces += [b["text"]] if b["kind"] != "text" else split_to_size(b["text"], size)
+        text = BLOB.sub("[encoded data omitted]\n", b["text"])
+        pieces += split_to_size(text, size) if b["kind"] == "text" else split_to_size(text, FIG_CAP, 0)
     out, cur = [], ""
     for p in pieces:
         if cur and len(cur) + 2 + len(p) > size:
@@ -96,6 +107,10 @@ if __name__ == "__main__":
     out = pack(blocks)
     assert any("+--+\n|ID|" * 1 in c and len(c) > SIZE for c in out), "figure kept whole"
     assert all(len(c) <= SIZE for c in out if "+--+" not in c)
+    big = pack([{"kind": "figure", "text": "rule = a / b\n" * 500}])
+    assert len(big) > 1 and all(len(c) <= FIG_CAP for c in big) and big[0].count("\n") > 50, "huge figure split on lines"
+    blob = pack([{"kind": "figure", "text": "-----BEGIN KEY-----\n" + ("QUJD" * 16 + "\n") * 300 + "=abcd\n-----END KEY-----"}])
+    assert len(blob) == 1 and "omitted" in blob[0] and "QUJD" not in blob[0], "encoded data dropped"
     meta = {"doc_id": "RFC2535", "doc_type": "rfc", "status": "PROPOSED STANDARD", "title": "DNSSEC",
             "obsoleted_by": ["RFC4033", "RFC4034", "RFC4035"], "updated_by": []}
     assert context(meta, "4.1", "SIG").startswith("RFC 2535 · Proposed Standard · OBSOLETED by 4033, 4034, 4035")

@@ -27,8 +27,15 @@ def _slug(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", _norm(title)).strip("-")
 
 
-def _is_refs(title: str) -> bool:
-    return "references" in _norm(title)
+REFS = re.compile(r"[-\s]*(?:appendix \w+ -+ )?(?:(?:normative|informative|informational|non-normative|implementation"
+                  r"|explanatory and informative|additional|other)\s+)?references(?: and (?:bibliography|citations))?")
+
+
+def _is_refs(title: str, depth: int = 1) -> bool:
+    """A bibliography, not a title that merely contains the word ('Key Server Preferences', 'Blob References').
+    A bare 'References' three levels down is the email header field."""
+    t = _norm(title)
+    return bool(REFS.fullmatch(t)) and not (depth >= 3 and t == "references")
 
 
 # --- Plain text ------------------------------------------------------------
@@ -38,16 +45,24 @@ PAGE_BREAK = re.compile(
     r"(?:(?:RFC \d+|Internet-Draft)[^\n]*\n)?"                        # running header
     r"(?:[ \t]*\n)*"                                                  # blank lines
 )
-HEADING = re.compile(r"^(\d+(?:\.\d+)*|Appendix [A-Z](?:\.\d+)*|[A-Z](?:\.\d+)+)\.?\s+(\S.{0,90})$")
+HEADING = re.compile(r"^(\d+(?:\.\d+)*|Appendix [A-Z](?:\.\d+)*|[A-Z](?:\.\d+)+|[A-Z](?=\.\s))\.?\s+(\S.{0,90})$")
 TOC_LINE = re.compile(r"(?:\.\s?){3,}\s*\d+\s*$")
 ART = re.compile(r"\+-{2,}|-{2,}\+|^\s*\|.*\|\s*$", re.M)
+ABNF = re.compile(r"^\s*[A-Za-z][\w-]*\s+=/?\s")
+PRE = (ABNF,
+       re.compile(r"^\s*[CS]:(\s|$)"),                                    # protocol transcript
+       re.compile(r"^\s*[A-Z][a-z]+(-[A-Za-z]+)*: \S"),                   # message header fields
+       re.compile(r"\sIN\s+(A|AAAA|NS|MX|TXT|SOA|CNAME|DS|DNSKEY|RRSIG)\s"),  # zone file
+       re.compile(r"^\s*[A-Za-z0-9+/=]{40,}$"))                           # base64 / hex
+MAX_INDENT = 16  # RFC 1341 indents section headings 12 columns
+BIG_SECTION = 600  # lines; a section this long has probably swallowed indented sub-headings
 
 
 def _join_page(m: re.Match) -> str:
     """Rejoin text split across a page: mid-sentence gets one newline, else a paragraph break."""
     before = m.string[: m.start()].rstrip()
     after = m.string[m.end():].lstrip(" ")
-    if before.endswith((".", ":")) and not after[:1].islower():
+    if before.endswith((".", ":")) and (not after[:1].islower() or ABNF.match(after)):
         return "\n\n"
     return "\n"
 
@@ -82,6 +97,14 @@ def _follows(prev: tuple | None, cur: tuple) -> bool:
     return False
 
 
+def _preformatted(p: list[str]) -> bool:
+    """Paragraph whose line breaks carry meaning. ponytail: line-pattern heuristic, continuation lines count via the ratio."""
+    if ART.search("\n".join(p)) or sum("|" in ln for ln in p) >= 2 or ABNF.search(p[0]):
+        return True
+    hits = max(sum(bool(rx.search(ln)) for ln in p) for rx in PRE)
+    return hits >= 2 and 3 * hits >= len(p)
+
+
 def _blocks(lines: list[str]) -> list[dict]:
     paras, cur = [], []
     for line in lines + [""]:
@@ -93,7 +116,7 @@ def _blocks(lines: list[str]) -> list[dict]:
     out: list[dict] = []
     for p in paras:
         raw = "\n".join(p)
-        if ART.search(raw) or sum("|" in ln for ln in p) >= 2:
+        if _preformatted(p):
             text = textwrap.dedent(raw)
             if out and out[-1]["kind"] == "figure":  # figure with a blank line inside
                 out[-1]["text"] += "\n\n" + text
@@ -104,24 +127,39 @@ def _blocks(lines: list[str]) -> list[dict]:
     return out
 
 
-def parse_txt(text: str) -> list[dict]:
-    lines = strip_pages(text).split("\n")
-    heads = []  # (line index, id, title, depth, parent)
-    last = None
+def _heads(lines: list[str], indent: int = 0, top_at_col0: bool = False) -> list[tuple]:
+    """(line index, id, title, depth, parent) for headings indented at most `indent` columns."""
+    heads, last = [], None
     for i, line in enumerate(lines):
-        if not line or line[0].isspace() or TOC_LINE.search(line):
+        s = line.strip()
+        col = len(line) - len(line.lstrip())
+        if not s or col > indent or TOC_LINE.search(line):
             continue
-        if _norm(line) in UNNUMBERED:
-            heads.append((i, _slug(line), line.strip(), 1, None))
+        if _norm(s) in UNNUMBERED:
+            heads.append((i, _slug(s), s, 1, None))
             continue
-        m = HEADING.match(line)
+        m = HEADING.match(s)
         if not m:
             continue
+        title, bare = m.group(2).strip().removeprefix("- "), m.group(1).isalpha()  # bare: an appendix written just "A."
         k = _key(m.group(1))
-        if _follows(last, k):
+        if (col or bare) and (title[0].islower() or title[0] == "-" or title[-1] in ".,:;" or (lines[i + 1 :] or [""])[0].strip()):
+            continue  # numbered paragraph or list item: a heading stands alone on its line
+        if col and top_at_col0 and len(k) == 1:
+            continue
+        if not (bare and last is None) and _follows(last, k):
             last = k
-            sid = ".".join(str(p) for p in k)
-            heads.append((i, sid, m.group(2).strip(), len(k), ".".join(str(p) for p in k[:-1]) or None))
+            heads.append((i, ".".join(str(p) for p in k), title, len(k), ".".join(str(p) for p in k[:-1]) or None))
+    return heads
+
+
+def parse_txt(text: str) -> list[dict]:
+    lines = strip_pages(text).split("\n")
+    heads = _heads(lines)
+    spans = [b[0] - a[0] for a, b in zip(heads, heads[1:] + [(len(lines),)])]
+    if not any(h[3] > 1 for h in heads) or max(spans, default=0) > BIG_SECTION:  # old RFCs indent their sub-headings
+        deep = _heads(lines, MAX_INDENT, top_at_col0=len(heads) >= 2)
+        heads = deep if len(deep) > len(heads) else heads
 
     sections = []
     for n, (i, sid, title, depth, parent) in enumerate(heads):
@@ -129,7 +167,7 @@ def parse_txt(text: str) -> list[dict]:
         if _norm(title) in DROP:
             continue
         sections.append({"id": sid, "title": title, "depth": depth, "parent": parent,
-                         "embed": not _is_refs(title), "blocks": _blocks(lines[i + 1 : end])})
+                         "embed": not _is_refs(title, depth), "blocks": _blocks(lines[i + 1 : end])})
     if sum(len(b["text"]) for s in sections for b in s["blocks"]) < 0.2 * len(text):
         # ponytail: no usable numbered headings (some pre-1000 RFCs); keep the whole text as one section.
         body = "\n".join(lines)
@@ -156,9 +194,7 @@ def _inline(el) -> str:
             s += f"Section {c.get('section')} of {dc}" if c.get("section") else dc
         elif c.tag == "eref":
             s += c.text or c.get("target") or ""
-        elif c.tag in ("artwork", "sourcecode"):
-            s += "\n" + (c.text or "") + "\n"
-        else:
+        elif c.tag not in ("artwork", "sourcecode"):  # those become figure blocks, see _nested_art
             s += _inline(c) + (" " if c.tag in BLOCKISH else "")
         s += c.tail or ""
     return s
@@ -172,6 +208,12 @@ def _artwork(fig) -> str:
     arts = [a for a in fig.iter() if a.tag in ("artwork", "sourcecode")]
     pick = next((a for a in arts if a.get("type") != "svg" and (a.text or "").strip()), None)
     return textwrap.dedent((pick.text if pick is not None else "").strip("\n"))
+
+
+def _nested_art(el) -> list[dict]:
+    """Code inside a list item or blockquote, which _inline leaves out."""
+    return [{"kind": "figure", "text": textwrap.dedent(a.text.strip("\n"))} for a in el.iter()
+            if a.tag in ("artwork", "sourcecode") and a.get("type") != "svg" and (a.text or "").strip()]
 
 
 def _xml_blocks(sec) -> list[dict]:
@@ -190,16 +232,19 @@ def _xml_blocks(sec) -> list[dict]:
             out.append({"kind": "table", "text": "\n".join(rows)})
         elif tag in ("ul", "ol"):
             out.append({"kind": "text", "text": "\n".join("- " + _clean(_inline(li)) for li in c.findall("li"))})
+            out += _nested_art(c)
         elif tag == "dl":
             items = list(c)
             pairs = [f"{_clean(_inline(a))}: {_clean(_inline(b))}" for a, b in zip(items[::2], items[1::2])]
             out.append({"kind": "text", "text": "\n".join(pairs)})
+            out += _nested_art(c)
         elif tag == "reference":
             out.append({"kind": "text", "text": f"[{c.get('anchor')}] {_clean(c.findtext('front/title') or '')}"})
         else:  # t, aside, blockquote, note
             text = _clean(_inline(c))
             if text:
                 out.append({"kind": "text", "text": text})
+            out += _nested_art(c)
     return out
 
 
@@ -218,7 +263,7 @@ def _walk(sec, parent, depth, refs, out) -> None:
     if _norm(title) in DROP:
         return
     sid = _xml_id(sec)
-    refs = refs or sec.tag == "references" or _is_refs(title)
+    refs = refs or sec.tag == "references" or _is_refs(title, depth)
     out.append({"id": sid, "title": title, "depth": depth, "parent": parent,
                 "embed": not refs, "blocks": _xml_blocks(sec)})
     for child in sec:
@@ -245,7 +290,7 @@ def section_text(sec: dict) -> str:
     return "\n\n".join(b["text"] for b in sec["blocks"])
 
 
-CITE_RFC = re.compile(r"\bRFC\s?(\d{1,5})\b")
+CITE_RFC = re.compile(r"\bRFC[\s-]?(\d{1,5})\b")
 CITE_DRAFT = re.compile(r"\b(?:draft-|I-D\.)([a-z0-9]+(?:-[a-z0-9]+)+)")
 
 
