@@ -1,7 +1,7 @@
 -- Idempotent: runs at DB init and again at the start of every ingest, so new columns/tables land on live DBs.
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Every RFC in the index (metadata only, for graph lookups) plus active DNS Internet-Drafts.
+-- Every RFC in the index (metadata only, for graph lookups) plus active DNS and email Internet-Drafts.
 CREATE TABLE IF NOT EXISTS documents (
     doc_id       text PRIMARY KEY,            -- 'RFC1035' or 'draft-ietf-dnsop-grease'
     doc_type     text NOT NULL,               -- 'rfc' | 'draft'
@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS documents (
     url          text
 );
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS also text[] NOT NULL DEFAULT '{}';  -- STD/BCP subseries, e.g. {STD13}
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS topics text[] NOT NULL DEFAULT '{}';  -- e.g. {dns}, {email}, {dns,email}
+CREATE INDEX IF NOT EXISTS documents_topics_idx ON documents USING gin (topics);
 CREATE INDEX IF NOT EXISTS documents_obsoletes_idx ON documents USING gin (obsoletes);
 CREATE INDEX IF NOT EXISTS documents_updates_idx ON documents USING gin (updates);
 CREATE INDEX IF NOT EXISTS documents_also_idx ON documents USING gin (also);

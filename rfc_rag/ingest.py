@@ -15,7 +15,7 @@ SCHEMA = Path(__file__).resolve().parent.parent / "schema.sql"
 
 DOC_COLS = ["doc_id", "doc_type", "title", "status", "stream", "wg", "area", "pub_date", "abstract",
             "obsoletes", "obsoleted_by", "updates", "updated_by", "in_scope", "draft_rev", "draft_state",
-            "expires", "url", "also"]
+            "expires", "url", "also", "topics"]
 
 
 def upsert_documents(cur, docs: list[dict]) -> None:
@@ -142,11 +142,16 @@ def main() -> None:
         conn.commit()
 
         for n, (doc, secs) in enumerate(parsed.items(), 1):
-            cur.execute("DELETE FROM cites WHERE src = %s", (doc,))
-            cur.executemany("INSERT INTO cites VALUES (%s, %s, %s)",
-                            [(doc, dst, kind) for dst, kind in parse.citations(secs, doc)])
-            conn.commit()
-            k = store_doc(conn, docs[doc], secs, errata.get(doc, []))
+            try:
+                cur.execute("DELETE FROM cites WHERE src = %s", (doc,))
+                cur.executemany("INSERT INTO cites VALUES (%s, %s, %s)",
+                                [(doc, dst, kind) for dst, kind in parse.citations(secs, doc)])
+                conn.commit()
+                k = store_doc(conn, docs[doc], secs, errata.get(doc, []))
+            except Exception as e:  # one bad document shouldn't cost the rest of a long embedding run
+                conn.rollback()
+                print(f"[{n}/{len(parsed)}] {doc}: FAILED {e!r}", flush=True)
+                continue
             print(f"[{n}/{len(parsed)}] {doc}: {len(secs)} sections, {k} embedded", flush=True)
 
 

@@ -17,9 +17,10 @@ from rfc_rag.db import connect
 mcp = MCPServer(
     "rfc-rag",
     instructions=(
-        "Search IETF DNS RFCs and active DNS Internet-Drafts. Every result carries its status. "
+        "Search IETF DNS and email RFCs and active Internet-Drafts. Every result carries its status. "
         "Prefer current documents (is_current=true), and cite as 'RFC N §X'. "
-        "Internet-Drafts are work in progress, not standards. "
+        "Internet-Drafts are work in progress, not standards; stream='individual' drafts are proposals no "
+        "working group has adopted. "
         "Use lineage() to find what replaced an obsolete RFC, and lookup_registry() for IANA code points."
     ),
 )
@@ -53,14 +54,15 @@ def anchor(url: str, sid: str | None) -> str:
 
 @mcp.tool()
 def search(query: str, k: int = 8, include_obsolete: bool = False, include_drafts: bool = False,
-           statuses: list[str] | None = None, docs: list[str] | None = None) -> list[dict]:
-    """Hybrid (semantic + keyword) search over DNS RFC sections and errata.
+           statuses: list[str] | None = None, docs: list[str] | None = None, topic: str | None = None) -> list[dict]:
+    """Hybrid (semantic + keyword) search over DNS and email RFC sections and errata.
 
     By default only current RFCs are searched: no obsoleted/Historic RFCs and no Internet-Drafts.
     statuses filters on RFC status, e.g. ["PROPOSED STANDARD", "INTERNET STANDARD", "BEST CURRENT PRACTICE"].
     docs limits the search to specific documents, e.g. ["RFC4034", "RFC4035"] (STD/BCP numbers also work).
+    topic limits the search to 'dns' or 'email'; by default both are searched.
     """
-    return _search(query, k, include_obsolete, include_drafts, statuses, docs)
+    return _search(query, k, include_obsolete, include_drafts, statuses, docs, topic=topic)
 
 
 # Sections handed to the reranker. ponytail: latency is ~linear in this (~0.2 s/passage on Docker CPU, bge-v2-m3).
@@ -68,7 +70,8 @@ POOL = int(os.environ.get("RERANK_POOL", "20"))
 
 
 def _search(query: str, k: int = 8, include_obsolete: bool = False, include_drafts: bool = False,
-            statuses: list[str] | None = None, docs: list[str] | None = None, rerank: bool = True) -> list[dict]:
+            statuses: list[str] | None = None, docs: list[str] | None = None, rerank: bool = True,
+            topic: str | None = None) -> list[dict]:
     k = min(k, 30)
     rerank = rerank and bool(reranker.URL)
     where, params = ["true"], {}
@@ -79,6 +82,9 @@ def _search(query: str, k: int = 8, include_obsolete: bool = False, include_draf
     if statuses:
         where.append("d.status = ANY(%(statuses)s)")
         params["statuses"] = [s.upper() for s in statuses]
+    if topic:
+        where.append("d.topics @> ARRAY[%(topic)s]")
+        params["topic"] = topic.lower()
     if docs:
         where.append("d.doc_id = ANY(%(docs)s)")
         with connect() as conn:
@@ -100,7 +106,7 @@ def _search(query: str, k: int = 8, include_obsolete: bool = False, include_draf
         FROM (SELECT * FROM vec UNION ALL SELECT * FROM lex) u GROUP BY chunk_id
         ORDER BY score DESC LIMIT %(k)s)
     SELECT c.doc_id, c.section_id, s.title AS section_title, c.kind, c.context, c.content, f.score,
-           d.title, d.status, d.is_current, d.obsoleted_by, d.updated_by, d.also, d.url,
+           d.title, d.status, d.stream, d.is_current, d.obsoleted_by, d.updated_by, d.also, d.url,
            EXISTS (SELECT 1 FROM errata e WHERE e.doc_id = c.doc_id AND e.section_id = c.section_id) AS has_errata
     FROM fused f JOIN chunks c USING (chunk_id) JOIN documents d USING (doc_id)
     LEFT JOIN sections s ON s.doc_id = c.doc_id AND s.section_id = c.section_id
@@ -155,7 +161,7 @@ def get_document(doc: str) -> dict:
 @mcp.tool()
 def cited_by(doc: str, current_only: bool = True, limit: int = 100) -> list[dict]:
     """Documents in the store whose References cite this RFC or draft, with their status and whether the
-    citation is normative. Only DNS documents in the store are scanned, so this is 'cited by DNS specs'."""
+    citation is normative. Only DNS and email documents in the store are scanned, not all RFCs."""
     with connect() as conn:
         return conn.execute(
             f"""SELECT d.doc_id, d.title, d.status, d.is_current, c.kind FROM cites c JOIN documents d ON d.doc_id = c.src
@@ -211,11 +217,16 @@ def lineage(doc: str) -> dict:
 
 @mcp.tool()
 def list_documents(status: str | None = None, wg: str | None = None, doc_type: str | None = None,
-                   current_only: bool = True, title_contains: str | None = None, limit: int = 100) -> list[dict]:
-    """List DNS documents in the store, filtered by status, working group, doc_type ('rfc'|'draft') or title."""
+                   current_only: bool = True, title_contains: str | None = None, limit: int = 100,
+                   topic: str | None = None) -> list[dict]:
+    """List documents in the store, filtered by status, working group, doc_type ('rfc'|'draft'), title or
+    topic ('dns'|'email')."""
     where, p = ["in_scope"], {"limit": min(limit, 500)}
     if current_only:
         where.append("(is_current OR doc_type = 'draft')")
+    if topic:
+        where.append("topics @> ARRAY[%(topic)s]")
+        p["topic"] = topic.lower()
     for col, val in (("status", status and status.upper()), ("wg", wg and wg.lower()), ("doc_type", doc_type)):
         if val:
             where.append(f"{col} = %({col})s")
@@ -224,23 +235,27 @@ def list_documents(status: str | None = None, wg: str | None = None, doc_type: s
         where.append("title ILIKE %(t)s")
         p["t"] = f"%{title_contains}%"
     with connect() as conn:
-        return conn.execute(f"SELECT doc_id, title, status, is_current, wg, pub_date FROM documents"
+        return conn.execute(f"SELECT doc_id, title, status, is_current, wg, stream, topics, pub_date FROM documents"
                             f" WHERE {' AND '.join(where)} ORDER BY doc_type, length(doc_id), doc_id LIMIT %(limit)s",
                             p).fetchall()
 
 
 @mcp.tool()
 def lookup_registry(query: str, registry: str | None = None) -> list[dict]:
-    """Look up IANA DNS registries (RR TYPEs, CLASSes, OpCodes, RCODEs, EDNS options, DNSSEC algorithms, ...)
-    by value or name, e.g. '65', 'HTTPS', 'ECDSAP256SHA256', 'BADCOOKIE'. Returns defining RFCs with their status."""
+    """Look up IANA registries by value or name. DNS: RR TYPEs, CLASSes, OpCodes, RCODEs, EDNS options, DNSSEC
+    algorithms, e.g. '65', 'HTTPS', 'ECDSAP256SHA256', 'BADCOOKIE'. Email: SMTP extensions and enhanced status
+    codes, message header fields, IMAP capabilities, DKIM/DMARC tags, Sieve, JMAP, e.g. '5.7.1', 'SIZE',
+    'DKIM-Signature'. Returns defining RFCs with their status."""
     q = query.strip()
+    # IANA lists enhanced status codes as X.7.1; people quote them as 5.7.1 or 4.7.1.
+    q = re.sub(r"^[245](?=\.\d+\.\d+$)", "X", q)
     p = {"q": q, "like": f"%{q}%", "reg": f"%{registry or ''}%"}
     with connect() as conn:
         rows = conn.execute(
             """SELECT registry, value, name, description, refs,
-                      (value = %(q)s OR lower(name) = lower(%(q)s)) AS exact
+                      (lower(value) = lower(%(q)s) OR lower(name) = lower(%(q)s)) AS exact
                FROM iana WHERE registry ILIKE %(reg)s
-                 AND (value = %(q)s OR name ILIKE %(like)s OR description ILIKE %(like)s)
+                 AND (lower(value) = lower(%(q)s) OR name ILIKE %(like)s OR description ILIKE %(like)s)
                ORDER BY exact DESC, registry LIMIT 25""", p).fetchall()
         refs = sorted({r for row in rows for r in row["refs"]})
         status = {r["doc_id"]: r for r in conn.execute(
